@@ -7,7 +7,11 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { phaseGate } from "../../../tests/support/lifecycleHarness.js";
 
-import { elfNote, elfNoteFixture } from "../../native/elf/ElfNotes.fixture.js";
+import {
+  elfNote,
+  elfNoteFixture,
+  withElf64DirectSectionCount,
+} from "../../native/elf/ElfNotes.fixture.js";
 import {
   MAX_INSPECT_ELF_NOTE_ENTRIES,
   MAX_INSPECT_ELF_NOTE_FILE_BYTES,
@@ -325,42 +329,53 @@ it("reports cancellation and keeps indexed paths for an unsupported remote listi
   });
 });
 
-it("keeps a resolved remote module beside one with a missing specifier", async () => {
-  const url = "https://example.com/mod.ts";
-  const snapshot = await inventoryOf(
-    "partial-remote",
-    denoElf(
-      buildDenoSection({
-        metadata: { ...defaultDenoMetadata(), entrypoint_key: url },
-        specifiers: [{ text: url, id: 1 }],
-        remoteModules: [
-          { specifierId: 1, data: "known" },
-          { specifierId: 2, data: "missing" },
-        ],
-      }),
-    ),
-  );
-  expect(
-    snapshot.occurrences.find((row) => row.logical_path === "."),
-  ).toMatchObject({
-    format_metadata: { remote_module_listing: "unsupported" },
-  });
-  expect(
-    snapshot.occurrences.find(
-      (row) => row.logical_path === "deno-remote/example.com/mod.ts",
-    ),
-  ).toMatchObject({
-    format_metadata: { source_path: url, entry_point: true },
-  });
-  expect(
-    snapshot.occurrences.find((row) => row.logical_path === "deno-remote/1"),
-  ).toMatchObject({
-    format_metadata: { source_path: null, entry_point: false },
-    limitations: expect.arrayContaining([
-      expect.stringContaining("not available as a logical path"),
-    ]),
-  });
-});
+it.each(["missing", "invalid UTF-8"] as const)(
+  "keeps a resolved remote module beside a %s specifier",
+  async (specifier) => {
+    const url = "https://example.com/mod.ts";
+    const snapshot = await inventoryOf(
+      "partial-remote",
+      denoElf(
+        buildDenoSection({
+          metadata: { ...defaultDenoMetadata(), entrypoint_key: url },
+          specifiers: [
+            { text: url, id: 1 },
+            ...(specifier === "invalid UTF-8"
+              ? [{ bytes: Buffer.from([0xff]), id: 2 }]
+              : []),
+          ],
+          remoteModules: [
+            { specifierId: 1, data: "known" },
+            { specifierId: 2, data: "missing" },
+          ],
+        }),
+      ),
+    );
+    expect(
+      snapshot.occurrences.find((row) => row.logical_path === "."),
+    ).toMatchObject({
+      format_metadata: {
+        specifier_listing: specifier === "missing" ? "listed" : "unsupported",
+        remote_module_listing: "unsupported",
+      },
+    });
+    expect(
+      snapshot.occurrences.find(
+        (row) => row.logical_path === "deno-remote/example.com/mod.ts",
+      ),
+    ).toMatchObject({
+      format_metadata: { index: 0, source_path: url, entry_point: true },
+    });
+    expect(
+      snapshot.occurrences.find((row) => row.logical_path === "deno-remote/1"),
+    ).toMatchObject({
+      format_metadata: { index: 1, source_path: null, entry_point: false },
+      limitations: expect.arrayContaining([
+        expect.stringContaining("not available as a logical path"),
+      ]),
+    });
+  },
+);
 
 it.each([
   ["a port", "http://localhost:8000/mod.ts", "localhost%3A8000/mod.ts"],
@@ -943,6 +958,29 @@ it("fails closed when a SUI note sits beside extended section numbering", async 
     status: "present",
     failure: { reason: "format" },
   });
+});
+
+it("records a reserved direct section count beside an independently confirmed program note", async () => {
+  const bytes = withElf64DirectSectionCount(denoElf(), 0xff00);
+  await expect(
+    locateDenoStandalone(bytesHandle(bytes), bytes.length),
+  ).resolves.toMatchObject({
+    status: "present",
+    failure: {
+      reason: "format",
+      message: expect.stringContaining("reserved direct section count"),
+    },
+  });
+});
+
+it("does not confirm a Deno carrier from a section note in a malformed table", async () => {
+  const bytes = withElf64DirectSectionCount(
+    gnuElf("section", suiNote()),
+    0xff00,
+  );
+  await expect(
+    locateDenoStandalone(bytesHandle(bytes), bytes.length),
+  ).resolves.toEqual({ status: "absent" });
 });
 
 it("reaches a SUI section note past an unreadable program table", async () => {
