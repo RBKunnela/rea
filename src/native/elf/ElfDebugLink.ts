@@ -8,6 +8,7 @@ import {
   yieldArtifactRead,
 } from "../../resources/index.js";
 import { readElfFixedHeader } from "../../domain/elfFixedHeader.js";
+import { hasElfMagic } from "../../domain/binaryContainer.js";
 import { elfObjectTypeName } from "../../domain/native/elfNotes.js";
 import {
   zstandardFrameAllowanceCause,
@@ -38,22 +39,26 @@ import {
 import {
   readElfImage,
   readElfImageCooperative,
+  readElfImageFromReader,
 } from "../../domain/native/elfImage.js";
+import type { NativeByteSource } from "../../domain/native/nativeSectionDirectory.js";
 import {
-  ElfNoteStorageFailure,
-  parseElfNotes,
-  parseElfNotesCooperative,
+  readElfBuildIds,
+  readElfBuildIdsCooperative,
+  readElfBuildIdsFromHandle,
+  type ElfNoteByteSource,
 } from "./ElfNoteParser.js";
 import type { ZstandardFramePause } from "../../domain/compression/zstandardExactFrame.js";
 import {
   sharedElfSectionNameDecoder,
   type CooperativeElfSectionNameDecoder,
+  type ElfSectionNameDecodeRequest,
 } from "../../domain/native/elfSectionNameTable.js";
 
 import { err, ok, type Result } from "../../domain/result.js";
 
 type PreparedCandidateImage = Result<ReturnType<typeof readElfImage>, unknown>;
-type PreparedNotes = Result<ReturnType<typeof parseElfNotes>, unknown>;
+type PreparedNotes = Result<ReturnType<typeof readElfBuildIds>, unknown>;
 
 type ElfSection = Extract<ImageSection, { format: "elf" }>;
 type Report = ElfDebugLink;
@@ -67,7 +72,6 @@ const DEBUG_SECTION_NAMES = [
   ".gnu_debugdata",
 ] as const;
 const XZ_MAGIC = Buffer.from([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]);
-const GNU_BUILD_ID_NOTE_TYPE = 3;
 
 const fits = (offset: bigint, size: bigint, fileLength: number): boolean =>
   offset >= 0n &&
@@ -124,46 +128,71 @@ interface LocatedSection {
   readonly reason: "not_file_backed" | "compressed" | "duplicate" | null;
 }
 
-const locate = (
-  bytes: Buffer,
+const locateMetadata = (
+  fileLength: number,
   found: readonly ElfSection[],
   namesComplete: boolean,
-): LocatedSection => {
+): Omit<LocatedSection, "body"> => {
   const section = found[0];
   if (section === undefined)
     return {
       status: namesComplete ? "absent" : "unknown",
       location: null,
-      body: null,
       reason: null,
     };
   if (found.length > 1)
     return {
       status: "malformed",
       location: null,
-      body: null,
       reason: "duplicate",
     };
   const location = locationOf(section);
-  if (section.type === 8 || location === null || !inFile(section, bytes.length))
+  if (section.type === 8 || location === null || !inFile(section, fileLength))
     return {
       status: "malformed",
       location: null,
-      body: null,
       reason: "not_file_backed",
     };
   if (section.compressed)
     return {
       status: "unsupported",
       location,
-      body: null,
       reason: "compressed",
     };
   return {
     status: "present",
     location,
-    body: bytes.subarray(location.offset, location.offset + location.bytes),
     reason: null,
+  };
+};
+
+const readSourceSlice = async (
+  source: NativeByteSource,
+  offset: number,
+  length: number,
+): Promise<Buffer> =>
+  length === 0
+    ? Buffer.alloc(0)
+    : source.prefix !== undefined && offset + length <= source.prefix.length
+      ? source.prefix.subarray(offset, offset + length)
+      : source.readRange(offset, length);
+
+const locateFromSource = async (
+  source: NativeByteSource,
+  found: readonly ElfSection[],
+  namesComplete: boolean,
+  maxBytes?: number,
+): Promise<LocatedSection> => {
+  const meta = locateMetadata(source.size, found, namesComplete);
+  if (meta.status !== "present" || meta.location === null)
+    return { ...meta, body: null };
+  const readLength =
+    maxBytes === undefined
+      ? meta.location.bytes
+      : Math.min(meta.location.bytes, maxBytes);
+  return {
+    ...meta,
+    body: await readSourceSlice(source, meta.location.offset, readLength),
   };
 };
 
@@ -179,13 +208,10 @@ const closedDebuglink = (
   reason,
 });
 
-const parseDebuglink = (
-  bytes: Buffer,
-  found: readonly ElfSection[],
-  namesComplete: boolean,
+const parseDebuglinkFromLocated = (
+  located: LocatedSection,
   little: boolean,
 ): Report["debuglink"] => {
-  const located = locate(bytes, found, namesComplete);
   if (located.reason === "duplicate")
     return closedDebuglink("malformed", "debuglink_duplicate_section");
   if (located.reason === "not_file_backed")
@@ -252,12 +278,9 @@ const closedAlt = (
   reason,
 });
 
-const parseDebugaltlink = (
-  bytes: Buffer,
-  found: readonly ElfSection[],
-  namesComplete: boolean,
+const parseDebugaltlinkFromLocated = (
+  located: LocatedSection,
 ): Report["debugaltlink"] => {
-  const located = locate(bytes, found, namesComplete);
   if (located.reason === "duplicate")
     return closedAlt("malformed", "debugaltlink_duplicate_section");
   if (located.reason === "not_file_backed")
@@ -329,12 +352,9 @@ const parseDebugaltlink = (
   };
 };
 
-const parseDebugdata = (
-  bytes: Buffer,
-  found: readonly ElfSection[],
-  namesComplete: boolean,
+const parseDebugdataFromLocated = (
+  located: LocatedSection,
 ): Report["debugdata"] => {
-  const located = locate(bytes, found, namesComplete);
   if (located.reason === "duplicate")
     return {
       status: "malformed",
@@ -395,24 +415,16 @@ const unknownBuildId = (
 
 const observeBuildId = (
   bytes: Buffer,
-  artifact: Report["artifact"],
   input: InspectElfDebugLinkInput,
   preparedNotes?: PreparedNotes,
 ): ObservedBuildId => {
-  let entries: ElfNoteStorageFailure["readableEntries"];
-  let unsupportedStorage: ElfNoteStorageFailure | undefined;
+  let notes: ReturnType<typeof readElfBuildIds>;
   try {
     if (preparedNotes !== undefined && !preparedNotes.ok)
       throw preparedNotes.error;
-    entries = (
+    notes =
       preparedNotes?.value ??
-      parseElfNotes(
-        bytes,
-        artifact,
-        buildIdNoteInput(artifact, input),
-        BUILD_ID_NOTE_OPTIONS,
-      )
-    ).entries;
+      readElfBuildIds(bytes, input, MAX_ELF_DEBUG_ALT_BUILD_ID_BYTES);
   } catch (cause) {
     if (
       isRethrownBudget(cause) ||
@@ -424,44 +436,19 @@ const observeBuildId = (
         "note_tables_malformed",
         `ELF note tables could not be decoded: ${cause.message}`,
       );
-    if (cause instanceof ElfNoteStorageFailure) {
-      unsupportedStorage = cause;
-      entries = cause.readableEntries;
-    } else if (cause instanceof BinaryFormatFailure) {
+    if (cause instanceof BinaryFormatFailure)
       return unknownBuildId(
         cause.kind === "unsupported"
           ? "note_tables_unsupported"
           : "note_tables_malformed",
         `ELF note tables could not be decoded: ${cause.message}`,
       );
-    } else {
-      throw cause;
-    }
+    throw cause;
   }
-  const ids: string[] = [];
-  const sources: BuildId["sources"] = [];
-  let oversized = false;
-  for (const entry of entries) {
-    if (entry.owner !== "GNU" || entry.type !== GNU_BUILD_ID_NOTE_TYPE)
-      continue;
-    // The parser leaves oversized descriptors undecoded, so judge the raw size.
-    if (entry.descsz > MAX_ELF_DEBUG_ALT_BUILD_ID_BYTES) {
-      oversized = true;
-      continue;
-    }
-    const hex = entry.gnu?.build_id_hex;
-    if (hex === null || hex === undefined || hex.length === 0) continue;
-    if (!ids.includes(hex)) ids.push(hex);
-    sources.push({
-      hex,
-      table_kind: entry.table_kind,
-      table_index: entry.table_index,
-      note: entry.location,
-      descriptor: entry.descriptor.location,
-    });
-  }
+  const { sources, oversized, unreadableStorage } = notes;
+  const ids = [...new Set(sources.map(({ hex }) => hex))];
   // Retain readable ids and their note locations when identity is incomplete.
-  if (unsupportedStorage !== undefined || oversized)
+  if (unreadableStorage !== null || oversized)
     return {
       buildId: {
         status: "unknown",
@@ -469,14 +456,13 @@ const observeBuildId = (
         ids,
         sources,
         reason:
-          unsupportedStorage === undefined
+          unreadableStorage === null
             ? "build_id_exceeds_limit"
             : "note_tables_unsupported",
       },
       limitation:
-        unsupportedStorage === undefined
-          ? "A GNU build-id exceeds 256 bytes and was not copied."
-          : unsupportedStorage.message,
+        unreadableStorage ??
+        "A GNU build-id exceeds 256 bytes and was not copied.",
     };
   if (ids.length === 0)
     return {
@@ -512,57 +498,18 @@ const sectionsNamed = (
   name: string,
 ): readonly ElfSection[] => sections.filter((section) => section.name === name);
 
-const BUILD_ID_NOTE_OPTIONS = {
-  maxGnuBuildIdBytes: MAX_ELF_DEBUG_ALT_BUILD_ID_BYTES,
-  retainReadableNotes: true,
-};
-const buildIdNoteInput = (
-  artifact: Report["artifact"],
-  input: InspectElfDebugLinkInput,
-) => ({
-  path: artifact.path,
-  max_file_bytes: input.max_file_bytes,
-  max_entries: input.max_entries,
-});
-
-/** Decode separate-debug linkage from one in-memory ELF image. */
 const ELF_DEBUG_LINK_OPERATION = "inspect_elf_debug_link";
 
-export const parseElfDebugLink = (
-  bytes: Buffer,
+const finalizeElfDebugLinkReport = (
+  image: ReturnType<typeof readElfImage>,
+  sections: readonly ElfSection[],
+  namesComplete: boolean,
   artifact: Report["artifact"],
-  input: InspectElfDebugLinkInput,
-  image?: ReturnType<typeof readElfImage>,
-  preparedNotes?: PreparedNotes,
+  debuglink: Report["debuglink"],
+  debugaltlink: Report["debugaltlink"],
+  debugdata: Report["debugdata"],
+  observed: ObservedBuildId,
 ): Report => {
-  // The directory admits section names before either decoder inflates them.
-  image =
-    image ??
-    readElfImage(bytes, ELF_DEBUG_LINK_OPERATION, input.max_file_bytes);
-  const sections = image.sections.filter(
-    (section): section is ElfSection => section.format === "elf",
-  );
-  const namesComplete =
-    image.section_names_limitation === undefined &&
-    sections.every((section) => section.name !== null);
-  const little = image.byte_order === "little";
-  const debuglink = parseDebuglink(
-    bytes,
-    sectionsNamed(sections, ".gnu_debuglink"),
-    namesComplete,
-    little,
-  );
-  const debugaltlink = parseDebugaltlink(
-    bytes,
-    sectionsNamed(sections, ".gnu_debugaltlink"),
-    namesComplete,
-  );
-  const debugdata = parseDebugdata(
-    bytes,
-    sectionsNamed(sections, ".gnu_debugdata"),
-    namesComplete,
-  );
-  const observed = observeBuildId(bytes, artifact, input, preparedNotes);
   const limitations: Limitations = [...ELF_DEBUG_LINK_LIMITATIONS];
   if (image.section_names_limitation !== undefined)
     limitations.push(image.section_names_limitation);
@@ -642,13 +589,9 @@ const candidateSections = (
   };
 };
 
-const hasElfMagic = (bytes: Buffer): boolean =>
-  bytes.length >= 4 && bytes.toString("hex", 0, 4) === "7f454c46";
-
 const readCandidateIdentity = (
   content: Buffer,
   totalBytes: number,
-  artifact: Report["artifact"],
   input: InspectElfDebugLinkInput,
   preparedImage?: PreparedCandidateImage,
   preparedNotes?: PreparedNotes,
@@ -748,7 +691,7 @@ const readCandidateIdentity = (
   let observed: ObservedBuildId | null = null;
   if (frameAllowance === undefined) {
     try {
-      observed = observeBuildId(content, artifact, input, preparedNotes);
+      observed = observeBuildId(content, input, preparedNotes);
     } catch (cause) {
       frameAllowance = zstandardFrameAllowanceCause(cause);
       if (frameAllowance === undefined && !isRethrownBudget(cause)) throw cause;
@@ -916,7 +859,6 @@ export const verifyElfDebugCandidate = (
   const read = readCandidateIdentity(
     candidate.prefix,
     candidate.bytes,
-    candidateArtifact(candidate),
     input,
     preparedImage,
     preparedNotes,
@@ -958,29 +900,19 @@ export const verifyElfDebugCandidate = (
 const debugLinkPause = (signal?: AbortSignal) => () =>
   yieldArtifactRead(signal);
 
-const candidateArtifact = (candidate: ElfDebugCandidateFile) => ({
-  path: candidate.path,
-  sha256: candidate.sha256,
-  bytes: candidate.bytes,
-});
-
 const prepareBuildIdNotes = async (
   bytes: Buffer,
-  artifact: Report["artifact"],
   input: InspectElfDebugLinkInput,
-  pause: ZstandardFramePause,
   decode: CooperativeElfSectionNameDecoder,
   signal: AbortSignal | undefined,
 ): Promise<PreparedNotes> => {
   assertArtifactReadActive(signal);
   try {
     return ok(
-      await parseElfNotesCooperative(
+      await readElfBuildIdsCooperative(
         bytes,
-        artifact,
-        buildIdNoteInput(artifact, input),
-        pause,
-        BUILD_ID_NOTE_OPTIONS,
+        input,
+        MAX_ELF_DEBUG_ALT_BUILD_ID_BYTES,
         decode,
       ),
     );
@@ -990,32 +922,93 @@ const prepareBuildIdNotes = async (
   }
 };
 
-/** Same linkage as {@link parseElfDebugLink}. Section names yield for `signal`. */
-export const parseElfDebugLinkCooperative = async (
-  bytes: Buffer,
+/** Decode separate-debug linkage positionally over a bounded file handle. */
+export const parseElfDebugLinkFromHandle = async (
+  source: ElfNoteByteSource,
   artifact: Report["artifact"],
   input: InspectElfDebugLinkInput,
   signal?: AbortSignal,
 ): Promise<Report> => {
   const pause = debugLinkPause(signal);
   const decode = sharedElfSectionNameDecoder(pause);
-  const image = await readElfImageCooperative(
-    bytes,
+  let sectionNames: ElfSectionNameDecodeRequest | undefined;
+  const image = await readElfImageFromReader(
+    source,
     ELF_DEBUG_LINK_OPERATION,
     pause,
     input.max_file_bytes,
-    decode,
+    (request) => {
+      sectionNames = request;
+      return decode(request);
+    },
   );
-  const notes = await prepareBuildIdNotes(
-    bytes,
-    artifact,
-    input,
-    pause,
-    decode,
-    signal,
-  );
+  // Both readers borrow the same stable file. Reuse only the exact extent
+  // admitted by the image reader so the decoder can share its result.
+  const noteSource: ElfNoteByteSource = {
+    size: source.size,
+    prefix: source.prefix,
+    readRange: (offset, length) =>
+      sectionNames?.fileOffset === offset && sectionNames.raw.length === length
+        ? Promise.resolve(sectionNames.raw)
+        : source.readRange(offset, length),
+  };
+  let notes: PreparedNotes;
   assertArtifactReadActive(signal);
-  return parseElfDebugLink(bytes, artifact, input, image, notes);
+  try {
+    notes = ok(
+      await readElfBuildIdsFromHandle(
+        noteSource,
+        input,
+        MAX_ELF_DEBUG_ALT_BUILD_ID_BYTES,
+        decode,
+      ),
+    );
+  } catch (cause) {
+    assertArtifactReadActive(signal);
+    notes = err(cause);
+  }
+  assertArtifactReadActive(signal);
+  const sections = image.sections.filter(
+    (section): section is ElfSection => section.format === "elf",
+  );
+  const namesComplete =
+    image.section_names_limitation === undefined &&
+    sections.every((section) => section.name !== null);
+  const little = image.byte_order === "little";
+  const debuglink = parseDebuglinkFromLocated(
+    await locateFromSource(
+      source,
+      sectionsNamed(sections, ".gnu_debuglink"),
+      namesComplete,
+    ),
+    little,
+  );
+  const debugaltlink = parseDebugaltlinkFromLocated(
+    await locateFromSource(
+      source,
+      sectionsNamed(sections, ".gnu_debugaltlink"),
+      namesComplete,
+    ),
+  );
+  const debugdata = parseDebugdataFromLocated(
+    await locateFromSource(
+      source,
+      sectionsNamed(sections, ".gnu_debugdata"),
+      namesComplete,
+      XZ_MAGIC.length,
+    ),
+  );
+  const observed = observeBuildId(Buffer.alloc(0), input, notes);
+  return finalizeElfDebugLinkReport(
+    image,
+    sections,
+    namesComplete,
+    artifact,
+    debuglink,
+    debugaltlink,
+    debugdata,
+    observed,
+  );
 };
 
 /** Same comparison as {@link verifyElfDebugCandidate}. Section names yield for `signal`. */
@@ -1057,9 +1050,7 @@ export const verifyElfDebugCandidateCooperative = async (
     return verifyElfDebugCandidate(report, candidate, input, preparedImage);
   const notes = await prepareBuildIdNotes(
     candidate.prefix,
-    candidateArtifact(candidate),
     input,
-    pause,
     decode,
     signal,
   );
