@@ -22,6 +22,7 @@ export interface AnalysisSettingValues {
   readonly "native.matching_representation_bytes": number;
   readonly "bridge.max_request_bytes": number;
   readonly "bridge.max_reply_bytes": number;
+  readonly "browser.timeline_retained_bytes": number;
   readonly "debugger.command_deadline_ms": number;
   readonly "debugger.max_command_output_bytes": number;
   readonly "hopper.caller_scan_budget_ms": number;
@@ -29,6 +30,7 @@ export interface AnalysisSettingValues {
   readonly "kuna.project_timeout_ms": number;
   readonly "kuna.function_timeout_ms": number;
   readonly "pwntools.max_input_bytes": number;
+  readonly "producer.output_bytes": number;
   readonly "windows.change_time_drift_ms": number;
   readonly "windows.change_time_settle_poll_ms": number;
   readonly "windows.change_time_settle_max_polls": number;

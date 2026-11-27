@@ -17,7 +17,7 @@ import { offlineArtifactFailureDialect } from "../../providers/offlineArtifactFa
 import { fixedAllowanceOptions } from "../../domain/fixedAllowanceRemediation.js";
 import { DWARF_UNITS_PROVIDER } from "../../domain/investigationProviders.js";
 import {
-  DWARF_DECOMPRESSED_SECTION_ALLOWANCE,
+  dwarfDecompressedLimit,
   dwarfUnitsSchema,
   type DwarfUnitsReport,
   dwarfUnitsFileLimit,
@@ -29,13 +29,13 @@ import {
   BinaryResourceFailure,
   isNativeStructureFailure,
 } from "../../domain/binaryContainer.js";
-import { nativeStructureConstraint } from "../nativeStructureConstraint.js";
+import { nativeStructureConstraint } from "../../domain/native/nativeStructureBudget.js";
 import { requireSelectedNativeImageFromReader } from "../../domain/apple/machoSliceSelection.js";
 import { parseDwarfCompileUnits } from "./DwarfUnitParser.js";
 import {
+  DWARF_RETAINED_SECTIONS_LIMIT,
   DwarfSectionAllowanceFailure,
   locateDwarfSectionsFromHandle,
-  PE_SECTION_NAME_LIMIT,
   type DebugInfoAvailability,
   type LocatedDwarfImage,
 } from "./DwarfSections.js";
@@ -98,7 +98,7 @@ export class DwarfUnitsProvider {
             );
             const located = await locateDwarfSectionsFromHandle(
               selected.source,
-              undefined,
+              input.max_decompressed_bytes,
               async () => {
                 await yieldArtifactRead(options?.signal);
               },
@@ -268,37 +268,26 @@ const dwarfUnitsFailure = (
         if (failure instanceof ZstandardFrameAllowanceError)
           return projectZstandardFrameAllowance(OPERATION, failure);
         if (failure instanceof DwarfSectionAllowanceFailure)
+          // Sections decompress in turn, so the need is known only so far.
+          return parseLimitConstraint(OPERATION, "memory", failure, {
+            retryable: false,
+            limit: dwarfDecompressedLimit(failure.failure.limit.maximum),
+          });
+        if (isNativeStructureFailure(failure))
+          return nativeStructureConstraint(OPERATION, failure);
+        if (
+          failure instanceof BinaryResourceFailure &&
+          failure.failure.limit.name === DWARF_RETAINED_SECTIONS_LIMIT
+        )
           return parseLimitConstraint(
             OPERATION,
             "memory",
             failure,
             fixedAllowanceOptions(
-              DWARF_DECOMPRESSED_SECTION_ALLOWANCE,
+              "The retained DWARF section bound",
               "parser",
-              {
-                limit: failure.failure.limit.maximum,
-                unit: "bytes",
-              },
+              binaryResourceCeiling(failure),
             ),
-          );
-        if (isNativeStructureFailure(failure))
-          return nativeStructureConstraint(OPERATION, failure);
-        if (failure instanceof BinaryResourceFailure)
-          return parseLimitConstraint(
-            OPERATION,
-            "memory",
-            failure,
-            failure.failure.limit.name === PE_SECTION_NAME_LIMIT
-              ? fixedAllowanceOptions(
-                  "The PE section-name decoding allowance",
-                  "parser",
-                  binaryResourceCeiling(failure),
-                )
-              : fixedAllowanceOptions(
-                  "The retained DWARF section bound",
-                  "parser",
-                  binaryResourceCeiling(failure),
-                ),
           );
         return undefined;
       },
